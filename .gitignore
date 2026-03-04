@@ -8,6 +8,7 @@ data/
 processed_data/
 model_checkpoints/
 mlruns/
+mlruns_named/
 mlflow_artifacts/
 
 # =========================
