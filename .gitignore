@@ -1,0 +1,62 @@
+# =========================
+# Large data / generated artifacts
+# =========================
+NDP38m_extracted/
+NDP38m_extracted_csv/
+NDP38m_test_data/
+data/
+processed_data/
+model_checkpoints/
+mlruns/
+mlflow_artifacts/
+
+# =========================
+# Scientific / numerical data formats
+# =========================
+*.csv
+*.mat
+*.npz
+*.npy
+*.h5
+*.hdf5
+
+# =========================
+# Generated visualizations & media
+# =========================
+figures/
+animations/
+*.png
+*.gif
+*.mp4
+
+# =========================
+# Python cache / build artifacts
+# =========================
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# =========================
+# Jupyter
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+env/
+
+# =========================
+# OS / editor files
+# =========================
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
