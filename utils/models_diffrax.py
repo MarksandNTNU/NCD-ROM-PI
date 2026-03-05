@@ -707,13 +707,18 @@ class MultiHeadAttention(eqx.Module):
 
 
 class SHREDAttention(eqx.Module):
-    """SHRED model with self-attention layers instead of LSTM.
+    """SHRED model with self-attention layers and FFN (feed-forward network).
     
-    Uses multi-head self-attention to process sequential data and compare
-    with LSTM-based sequential processing.
+    Uses multi-head self-attention with feed-forward networks to process sequential data,
+    matching the standard Transformer architecture. Each block contains:
+    - LayerNorm → MultiHeadAttention → Residual
+    - LayerNorm → FFN (MLP) → Residual
     """
     attention_layers: tuple
     fc_layers: tuple
+    ffn_layers: tuple
+    layer_norms_attn: tuple
+    layer_norms_ffn: tuple
     decoder: eqx.nn.Sequential
     hidden_size: int
     num_attention_layers: int
@@ -726,6 +731,7 @@ class SHREDAttention(eqx.Module):
         hidden_size=64,
         num_attention_layers=2,
         num_heads=4,
+        ffn_width=256,
         decoder_sizes=(350, 400),
         activation=jax.nn.relu,
         *,
@@ -738,14 +744,39 @@ class SHREDAttention(eqx.Module):
         self.num_attention_layers = num_attention_layers
         self.use_layer_norm = use_layer_norm
         
-        # Split keys for attention layers, projection layers, and decoder layers
+        # Split keys for all layer types
+        # num_attention_layers attention layers
+        # num_attention_layers input projection layers
+        # num_attention_layers FFN layers
+        # 2 * num_attention_layers layer norms (for attention and FFN)
+        # num_decoder_layers for decoder
         num_decoder_layers = len(decoder_sizes) + 1
-        total_keys_needed = num_attention_layers * 2 + num_decoder_layers
+        total_keys_needed = (
+            num_attention_layers +  # attention layers
+            num_attention_layers +  # input projection layers
+            num_attention_layers +  # FFN layers
+            (2 * num_attention_layers if use_layer_norm else 0) +  # layer norms
+            num_decoder_layers  # decoder layers
+        )
         keys = jr.split(key, total_keys_needed)
         
-        attn_keys = keys[:num_attention_layers]
-        fc_keys = keys[num_attention_layers:num_attention_layers * 2]
-        dec_keys = keys[num_attention_layers * 2:]
+        key_idx = 0
+        attn_keys = keys[key_idx:key_idx + num_attention_layers]
+        key_idx += num_attention_layers
+        
+        fc_keys = keys[key_idx:key_idx + num_attention_layers]
+        key_idx += num_attention_layers
+        
+        ffn_keys = keys[key_idx:key_idx + num_attention_layers]
+        key_idx += num_attention_layers
+        
+        if use_layer_norm:
+            ln_attn_keys = keys[key_idx:key_idx + num_attention_layers]
+            key_idx += num_attention_layers
+            ln_ffn_keys = keys[key_idx:key_idx + num_attention_layers]
+            key_idx += num_attention_layers
+        
+        dec_keys = keys[key_idx:key_idx + num_decoder_layers]
         
         # Create attention layers
         attention_layers = []
@@ -754,16 +785,40 @@ class SHREDAttention(eqx.Module):
             attention_layers.append(attn)
         self.attention_layers = tuple(attention_layers)
         
-        # Create projection layers (input to hidden and between layers)
-        # First layer: input_size -> hidden_size
-        # Other layers: hidden_size -> hidden_size (for residual connections)
+        # Create input projection layers (input to hidden and between layers)
         fc_layers = []
         fc_layers.append(eqx.nn.Linear(input_size, hidden_size, key=fc_keys[0]))
         for i in range(1, num_attention_layers):
             fc_layers.append(eqx.nn.Linear(hidden_size, hidden_size, key=fc_keys[i]))
         self.fc_layers = tuple(fc_layers)
         
-        # Build decoder: hidden_size -> output_size with LayerNorm
+        # Create FFN (feed-forward network) layers for each attention block
+        # Standard transformer FFN: hidden_size -> ffn_width -> hidden_size
+        ffn_layers = []
+        for i in range(num_attention_layers):
+            ffn = eqx.nn.MLP(
+                in_size=hidden_size,
+                out_size=hidden_size,
+                width_size=ffn_width,
+                depth=2,
+                activation=activation,
+                final_activation=activation,
+                key=ffn_keys[i],
+            )
+            ffn_layers.append(ffn)
+        self.ffn_layers = tuple(ffn_layers)
+        
+        # Create layer norms for transformer-style attention blocks
+        if use_layer_norm:
+            layer_norms_attn = [eqx.nn.LayerNorm(hidden_size) for _ in range(num_attention_layers)]
+            layer_norms_ffn = [eqx.nn.LayerNorm(hidden_size) for _ in range(num_attention_layers)]
+            self.layer_norms_attn = tuple(layer_norms_attn)
+            self.layer_norms_ffn = tuple(layer_norms_ffn)
+        else:
+            self.layer_norms_attn = tuple()
+            self.layer_norms_ffn = tuple()
+        
+        # Build decoder: hidden_size -> output_size
         sizes = (hidden_size,) + tuple(decoder_sizes) + (output_size,)
         layers = []
         for i in range(len(sizes) - 1):
@@ -787,18 +842,35 @@ class SHREDAttention(eqx.Module):
         # Project input to hidden dimension
         h = jax.vmap(self.fc_layers[0])(x)  # (seq_length, hidden_size)
         
-        # Apply attention layers with residual connections
+        # Apply transformer blocks: attention + FFN with residual connections
         for i, attn_layer in enumerate(self.attention_layers):
-            # Apply attention
-            attn_out = attn_layer(h)  # (seq_length, hidden_size)
+            # ─── Attention Block ───
+            # LayerNorm before attention (pre-norm transformer style)
+            if self.use_layer_norm:
+                h_norm = jax.vmap(self.layer_norms_attn[i])(h)
+            else:
+                h_norm = h
+            
+            # Multi-head attention
+            attn_out = attn_layer(h_norm)  # (seq_length, hidden_size)
             
             # Residual connection
-            h = h + attn_out
+            h = h + attn_out  # (seq_length, hidden_size)
             
-            # Layer normalization (optional, but helps with training stability)
-            h = h / (jnp.linalg.norm(h, axis=-1, keepdims=True) + 1e-6)
+            # ─── Feed-Forward Network (FFN) Block ───
+            # LayerNorm before FFN
+            if self.use_layer_norm:
+                h_norm = jax.vmap(self.layer_norms_ffn[i])(h)
+            else:
+                h_norm = h
             
-            # Optional: Apply activation and projection
+            # FFN: vmap over sequence dimension since it's per-token
+            ffn_out = jax.vmap(self.ffn_layers[i])(h_norm)  # (seq_length, hidden_size)
+            
+            # Residual connection
+            h = h + ffn_out  # (seq_length, hidden_size)
+            
+            # Optional: Apply projection to next layer if available
             if i < len(self.fc_layers) - 1:
                 h_proj = jax.vmap(self.fc_layers[i + 1])(h)
                 h = h + jax.nn.relu(h_proj)  # Another residual connection
