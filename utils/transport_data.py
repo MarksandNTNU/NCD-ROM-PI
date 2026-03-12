@@ -77,7 +77,7 @@ def ic_gaussian_bumps(
     u0  = np.zeros_like(x, dtype=np.float64)
     for _ in range(n_bumps):
         mu  = rng.uniform(0, L)
-        sig = rng.uniform(0.15, 0.45)
+        sig = rng.uniform(0.25, 1)
         amp = rng.uniform(0.5, 1.5)
         for shift in [-1, 0, 1]:
             u0 += amp * np.exp(-0.5 * ((x - mu - shift * L) / sig) ** 2)
@@ -121,7 +121,7 @@ def ic_mixed(
     """
     if rng is None:
         rng = np.random.default_rng()
-    w  = rng.uniform(0.3, 0.7)
+    w  = rng.uniform(0.1, 0.9)
     u0 = (
         w * ic_gaussian_bumps(x, n_bumps=rng.integers(1, 4), rng=rng)
         + (1 - w) * ic_fourier_modes(x, Kmax=rng.integers(2, 7), rng=rng)
