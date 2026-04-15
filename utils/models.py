@@ -1,3 +1,5 @@
+from statistics import mode
+
 import torch
 from torch.utils.data import DataLoader
 from copy import deepcopy
@@ -5,54 +7,70 @@ from .processdata_torch import mse, mre, num2p
 
 class SHRED(torch.nn.Module):
 
-    def __init__(self, input_size, output_size, hidden_size = 64, hidden_layers = 2, decoder_sizes = [350, 400], dropout = 0.0, activation = torch.nn.ReLU()):
-        '''
-        SHRED model definition
-        
-        Inputs
-        	input size (e.g. number of sensors)
-        	output size (e.g. full-order variable dimension)
-        	size of LSTM hidden layers (default to 64)
-        	number of LSTM hidden layers (default to 2)
-        	list of decoder layers sizes (default to [350, 400])
-        	dropout parameter (default to 0)
-        '''
-            
-        super(SHRED,self).__init__()
+    def __init__(self, input_size, output_size, hidden_size=64, hidden_layers=2,
+                 decoder_sizes=None, dropout=0.0, activation=None,
+                 device=torch.device("cpu"), mode='window'):
+        """SHRED model.
 
-        self.lstm = torch.nn.LSTM(input_size = input_size,
-                                  hidden_size = hidden_size,
-                                  num_layers = hidden_layers,
+        mode='window'   : input (B, L, input_size)  → output (B, output_size)
+                          Uses only the last LSTM hidden state. Compatible with
+                          padded-window TimeSeriesDataset.
+        mode='seq2seq'  : input (B, L, input_size)  → output (B, L, output_size)
+                          Applies the decoder at every timestep.
+        """
+        super(SHRED, self).__init__()
+
+        if mode not in ('window', 'seq2seq'):
+            raise ValueError("mode must be 'window' or 'seq2seq'")
+        self.mode = mode
+
+        if activation is None:
+            activation = torch.nn.ReLU()
+
+        if decoder_sizes is None:
+            decoder_sizes = [350, 400]
+        else:
+            decoder_sizes = list(decoder_sizes)
+
+        self.lstm = torch.nn.LSTM(input_size=input_size,
+                                  hidden_size=hidden_size,
+                                  num_layers=hidden_layers,
                                   batch_first=True)
-        
+
         self.decoder = torch.nn.ModuleList()
         decoder_sizes.insert(0, hidden_size)
         decoder_sizes.append(output_size)
 
-        for i in range(len(decoder_sizes)-1):
-            self.decoder.append(torch.nn.Linear(decoder_sizes[i], decoder_sizes[i+1]))
-            if i != len(decoder_sizes)-2:
+        for i in range(len(decoder_sizes) - 1):
+            self.decoder.append(torch.nn.Linear(decoder_sizes[i], decoder_sizes[i + 1]))
+            if i != len(decoder_sizes) - 2:
                 self.decoder.append(torch.nn.Dropout(dropout))
-                self.decoder.append(activation )
+                self.decoder.append(activation)
 
         self.hidden_layers = hidden_layers
         self.hidden_size = hidden_size
+        self.device = device
+
+    def _decode(self, h):
+        """Apply decoder MLP to a tensor of shape (..., hidden_size)."""
+        for layer in self.decoder:
+            h = layer(h)
+        return h
 
     def forward(self, x):
-        
-        h_0 = torch.zeros((self.hidden_layers, x.size(0), self.hidden_size), dtype=torch.float)
-        c_0 = torch.zeros((self.hidden_layers, x.size(0), self.hidden_size), dtype=torch.float)
-        if next(self.parameters()).is_cuda:
-            h_0 = h_0.cuda()
-            c_0 = c_0.cuda()
+        h_0 = torch.zeros((self.hidden_layers, x.size(0), self.hidden_size),
+                          dtype=torch.float, device=x.device)
+        c_0 = torch.zeros_like(h_0)
 
-        _, (output, _) = self.lstm(x, (h_0, c_0))
-        output = output[-1].view(-1, self.hidden_size)
-
-        for layer in self.decoder:
-            output = layer(output)
-
-        return output
+        if self.mode == 'seq2seq':
+            # all_hidden: (B, L, hidden_size)
+            all_hidden, _ = self.lstm(x, (h_0, c_0))
+            return self._decode(all_hidden)          # (B, L, output_size)
+        else:
+            # window mode: use last hidden state only
+            _, (last_hidden, _) = self.lstm(x, (h_0, c_0))
+            output = last_hidden[-1]                 # (B, hidden_size)
+            return self._decode(output)              # (B, output_size)
 
     def freeze(self):
 
@@ -89,6 +107,7 @@ def fit(model, train_dataset, valid_dataset, batch_size = 64, epochs = 4000, opt
 
     train_loader = DataLoader(train_dataset, shuffle = True, batch_size = batch_size)
     optimizer = optim(model.parameters(), lr = lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
 
     train_error_list = []
     valid_error_list = []
@@ -114,8 +133,11 @@ def fit(model, train_dataset, valid_dataset, batch_size = 64, epochs = 4000, opt
             train_error_list.append(train_error)
             valid_error_list.append(valid_error)
 
+        scheduler.step(valid_error)
+        current_lr = optimizer.param_groups[0]['lr']
+
         if verbose == True:
-            print("Epoch "+ str(epoch) + ": Training loss = " + formatter(train_error_list[-1]) + " \t Validation loss = " + formatter(valid_error_list[-1]) + " "*10, end = "\r")
+            print("Epoch "+ str(epoch) + ": Training loss = " + formatter(train_error_list[-1]) + " \t Validation loss = " + formatter(valid_error_list[-1]) + "\t lr=" + f"{current_lr:.2e}" + "\t patience " + str(patience_counter),  end = "\r")
 
         if valid_error == torch.min(torch.tensor(valid_error_list)):
             patience_counter = 0
@@ -129,7 +151,7 @@ def fit(model, train_dataset, valid_dataset, batch_size = 64, epochs = 4000, opt
             valid_error = loss_output(valid_dataset.Y, model(valid_dataset.X))
             
             if verbose == True:
-                print("Training done: Training loss = " + formatter(train_error) + " \t Validation loss = " + formatter(valid_error))
+                print("Training done: Training loss = " + formatter(train_error) + " \t Validation loss = " + formatter(valid_error) + "\t lr=" + f"{optimizer.param_groups[0]['lr']:.2e}" + "\t patience " + str(patience_counter) )
          
             return torch.tensor(train_error_list).detach().cpu().numpy(), torch.tensor(valid_error_list).detach().cpu().numpy()
     
@@ -138,7 +160,7 @@ def fit(model, train_dataset, valid_dataset, batch_size = 64, epochs = 4000, opt
     valid_error = loss_output(valid_dataset.Y, model(valid_dataset.X))
     
     if verbose == True:
-    	print("Training done: Training loss = " + formatter(train_error) + " \t Validation loss = " + formatter(valid_error))  
+    	print("Training done: Training loss = " + formatter(train_error) + " \t Validation loss = " + formatter(valid_error) + "\t lr=" + f"{optimizer.param_groups[0]['lr']:.2e}" + "\t patience " + str(patience_counter) )
     
     return torch.tensor(train_error_list).detach().cpu().numpy(), torch.tensor(valid_error_list).detach().cpu().numpy()
  
@@ -162,7 +184,6 @@ def forecast(forecaster, input_data, steps, nsensors):
         input_data[:,-1, :nsensors] = forecast[i]
 
     return torch.stack(forecast, 1)
-
 
 
 

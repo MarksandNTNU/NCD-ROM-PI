@@ -59,25 +59,6 @@ def mre(datatrue, datapred, eps=1e-12):
     return (num / den).mean()
 
 
-# ════════════════════════════════════════════════════════════════
-#  Activation helper
-# ════════════════════════════════════════════════════════════════
-
-def _get_activation(name: str) -> nn.Module:
-    """Return an activation module from a string name."""
-    name = name.lower()
-    activations = {
-        "gelu": nn.GELU,
-        "relu": nn.ReLU,
-        "silu": nn.SiLU,
-        "tanh": nn.Tanh,
-        "elu": nn.ELU,
-        "leaky_relu": nn.LeakyReLU,
-        "mish": nn.Mish,
-    }
-    if name not in activations:
-        raise ValueError(f"Unknown activation '{name}'. Choose from {list(activations.keys())}")
-    return activations[name]()
 
 
 # ════════════════════════════════════════════════════════════════
@@ -102,7 +83,7 @@ class SHREDSeq2Seq(nn.Module):
         rnn_type: str = "gru",
         dropout: float = 0.1,
         bidirectional: bool = False,
-        activation: str = "gelu",
+        activation=nn.GELU,
         decoder_hidden: int = 256,
     ):
         super().__init__()
@@ -131,9 +112,9 @@ class SHREDSeq2Seq(nn.Module):
         d_rnn = hidden_dim * (2 if bidirectional else 1)
         self.decoder = nn.Sequential(
             nn.Linear(d_rnn, decoder_hidden // 2),
-            _get_activation(activation),
+            activation(),
             nn.Linear(decoder_hidden // 2, decoder_hidden),
-            _get_activation(activation),
+            activation(),
             nn.Dropout(dropout),
             nn.Linear(decoder_hidden, n_modes),
         )
@@ -209,14 +190,14 @@ class LSSLLayer(nn.Module):
         dropout=0.0,
         prenorm=True,
         device=None,
-        activation: str = "glu",
+        activation=nn.GLU,
     ):
         super().__init__()
         self.prenorm = prenorm
         self.norm = nn.LayerNorm(d_model)
         self.kernel = LSSLKernel(d_model, state_dim, l_max, dt_min, dt_max, device)
         self.dropout = nn.Dropout(dropout)
-        if activation.lower() == "glu":
+        if activation is nn.GLU:
             self.output_linear = nn.Sequential(
                 nn.Linear(d_model, 2 * d_model),
                 nn.GLU(dim=-1),
@@ -224,7 +205,7 @@ class LSSLLayer(nn.Module):
         else:
             self.output_linear = nn.Sequential(
                 nn.Linear(d_model, d_model),
-                _get_activation(activation),
+                activation(),
             )
 
     def _fft_conv(self, u, k):
@@ -265,7 +246,7 @@ class LSSLStack(nn.Module):
         dropout=0.0,
         prenorm=True,
         device=None,
-        activation: str = "glu",
+        activation=nn.GLU,
     ):
         super().__init__()
         self.encoder = nn.Linear(d_input, d_model)
@@ -432,7 +413,7 @@ class S4DLayer(nn.Module):
         dropout: float = 0.0,
         bidirectional: bool = False,
         l_max: int = 1024,
-        activation: str = "glu",
+        activation=nn.GLU,
     ):
         super().__init__()
         self.d_model = d_model
@@ -446,7 +427,7 @@ class S4DLayer(nn.Module):
         conv_channels = 2 * (2 if bidirectional else 1)
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
-        if activation.lower() == "glu":
+        if activation is nn.GLU:
             self.output_linear = nn.Sequential(
                 nn.Linear(conv_channels * d_model, 2 * d_model),
                 nn.GLU(dim=-1),
@@ -454,7 +435,7 @@ class S4DLayer(nn.Module):
         else:
             self.output_linear = nn.Sequential(
                 nn.Linear(conv_channels * d_model, d_model),
-                _get_activation(activation),
+                activation(),
             )
 
     def _fft_conv(self, u, k):
@@ -487,7 +468,7 @@ class S4DBlock(nn.Module):
         dropout: float = 0.0,
         expansion: int = 2,
         l_max: int = 1024,
-        activation: str = "glu",
+        activation=nn.GLU,
     ):
         super().__init__()
         inner = expansion * d_model
@@ -525,7 +506,7 @@ class SensorToPODS4D(nn.Module):
         n_layers: int = 4,
         dropout: float = 0.1,
         l_max: int = 1024,
-        activation: str = "glu",
+        activation=nn.GLU,
     ):
         super().__init__()
         self.encoder = nn.Linear(n_sensors, d_model)
@@ -572,7 +553,7 @@ def _make_hippo_legs(N: int):
 class _DiagS4DLayer(nn.Module):
     """S4D diagonal approximation with per-channel step sizes, MPS-safe real arithmetic."""
 
-    def __init__(self, d_input: int, d_state: int = 64, dropout: float = 0.1, activation: str = "gelu"):
+    def __init__(self, d_input: int, d_state: int = 64, dropout: float = 0.1, activation=nn.GELU):
         super().__init__()
         A_np, _ = _make_hippo_legs(d_state)
         eigs = np.linalg.eigvals(A_np)
@@ -591,7 +572,7 @@ class _DiagS4DLayer(nn.Module):
         self.log_step = nn.Parameter(torch.zeros(d_input).uniform_(-4, -1))
         self.dropout = nn.Dropout(dropout)
         self.norm = nn.LayerNorm(d_input)
-        self.act = _get_activation(activation)
+        self.act = activation()
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
         B, L, H = u.shape
@@ -641,7 +622,7 @@ class S4DModel(nn.Module):
         d_state: int = 64,
         n_layers: int = 4,
         dropout: float = 0.1,
-        activation: str = "gelu",
+        activation=nn.GELU,
     ):
         super().__init__()
         self.input_proj = nn.Linear(n_sensors, d_model)
@@ -650,9 +631,9 @@ class S4DModel(nn.Module):
         )
         self.decoder = nn.Sequential(
             nn.Linear(d_model, 256),
-            _get_activation(activation),
+            activation(),
             nn.Linear(256, 512),
-            _get_activation(activation),
+            activation(),
             nn.Linear(512, n_modes),
         )
 
@@ -680,6 +661,7 @@ def train_model(
     batch_size: int = 16,
     lr: float = 1e-3,
     patience: int = 20,
+    lr_patience: int = 10,
     weight_decay: float = 0.01,
     grad_clip: float = 1.0,
     label: str = "model",
@@ -709,7 +691,7 @@ def train_model(
     )
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=max(patience // 2, 5), factor=0.5)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=lr_patience, factor=0.5)
 
     best_val = float("inf")
     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -736,7 +718,7 @@ def train_model(
         with torch.no_grad():
             for xb, yb in val_dl:
                 xb, yb = xb.to(device), yb.to(device)
-                vl_sum += F.mse_loss(model(xb), yb).item()
+                vl_sum += loss_fun(model(xb), yb).item()
         vl_loss = vl_sum / max(len(val_dl), 1)
 
         tr_losses.append(tr_loss)
