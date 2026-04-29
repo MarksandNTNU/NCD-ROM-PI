@@ -78,9 +78,20 @@ def _lssl_hippo_diag(N: int, device=None):
 
 
 class LSSLKernel(nn.Module):
-    def __init__(self, d_model, state_dim, l_max, dt_min=1e-3, dt_max=1e-1, device=None, a_init="diagonal"):
+    def __init__(
+        self,
+        d_model,
+        state_dim,
+        l_max,
+        dt_min=1e-3,
+        dt_max=1e-1,
+        device=None,
+        a_init="diagonal",
+        learn_cd=False,
+    ):
         super().__init__()
         self.a_init = a_init
+        self.learn_cd = learn_cd
         if a_init == "nplr":
             lam, P0, _ = make_nplr_legs(state_dim, device=device)
             self.Lambda_re = nn.Parameter(lam.real.unsqueeze(0).repeat(d_model, 1))
@@ -94,9 +105,13 @@ class LSSLKernel(nn.Module):
         scale = 1.0 / math.sqrt(state_dim)
         self.B_re = nn.Parameter(torch.randn(d_model, state_dim, device=device) * scale)
         self.B_im = nn.Parameter(torch.zeros(d_model, state_dim, device=device))
-        self.C_re = nn.Parameter(torch.randn(d_model, state_dim, device=device) * scale)
-        self.C_im = nn.Parameter(torch.zeros(d_model, state_dim, device=device))
-        self.D = nn.Parameter(torch.ones(d_model, device=device))
+        if learn_cd:
+            self.C_re = nn.Parameter(torch.randn(d_model, state_dim, device=device) * scale)
+            self.C_im = nn.Parameter(torch.zeros(d_model, state_dim, device=device))
+            self.D = nn.Parameter(torch.ones(d_model, device=device))
+        else:
+            # Lean SSM: tie C to B and remove direct feedthrough term D.
+            self.register_buffer("D", torch.zeros(d_model, device=device))
         self.log_dt = nn.Parameter(
             torch.empty(d_model, device=device).uniform_(math.log(dt_min), math.log(dt_max))
         )
@@ -115,7 +130,10 @@ class LSSLKernel(nn.Module):
         if self.a_init == "nplr":
             return self._kernel_nplr(L)
         a_bar, b_bar = self._bilinear()
-        C = torch.complex(self.C_re, self.C_im)
+        if self.learn_cd:
+            C = torch.complex(self.C_re, self.C_im)
+        else:
+            C = torch.complex(self.B_re, self.B_im)
         k = torch.arange(L, device=a_bar.device)
         a_pow = torch.exp(torch.log(a_bar).unsqueeze(-1) * k.to(a_bar.dtype))
         return ((C * b_bar).unsqueeze(-1) * a_pow).sum(dim=1).real
@@ -125,7 +143,6 @@ class LSSLKernel(nn.Module):
         Lambda = torch.complex(-F.softplus(self.Lambda_re), self.Lambda_im)  # (d, N)
         P = torch.complex(self.P_re, self.P_im)                              # (d, N)
         B = torch.complex(self.B_re, self.B_im)                              # (d, N)
-        C = torch.complex(self.C_re, self.C_im)                              # (d, N)
         dt = torch.exp(self.log_dt)                                          # (d,)
 
         # Roots of unity for IFFT recovery of the kernel
@@ -149,11 +166,20 @@ class LSSLKernel(nn.Module):
         # Rank-1 Woodbury correction terms  (d, L)
         PRB = (P.conj()[:, None, :] * R * B[:, None, :]).sum(dim=-1)
         PRP = (P.conj()[:, None, :] * R * P[:, None, :]).sum(dim=-1)
-        CRB = (C.conj()[:, None, :] * R * B[:, None, :]).sum(dim=-1)
-        CRP = (C.conj()[:, None, :] * R * P[:, None, :]).sum(dim=-1)
+
+        if self.learn_cd:
+            C = torch.complex(self.C_re, self.C_im)                          # (d, N)
+            CRB = (C.conj()[:, None, :] * R * B[:, None, :]).sum(dim=-1)
+            CRP = (C.conj()[:, None, :] * R * P[:, None, :]).sum(dim=-1)
+            K_hat_core = CRB - CRP * PRB / (1.0 + PRP)
+        else:
+            # Lean SSM: C is tied to B, so remove explicit C algebra.
+            BRB = (B.conj()[:, None, :] * R * B[:, None, :]).sum(dim=-1)
+            BRP = (B.conj()[:, None, :] * R * P[:, None, :]).sum(dim=-1)
+            K_hat_core = BRB - BRP * PRB / (1.0 + PRP)
 
         # Full NPLR kernel in frequency domain
-        K_hat = (2.0 / denom_z)[None, :] * (CRB - CRP * PRB / (1.0 + PRP))  # (d, L)
+        K_hat = (2.0 / denom_z)[None, :] * K_hat_core  # (d, L)
         return torch.fft.ifft(K_hat, n=L, dim=-1).real  # (d, L)
 
     def forward(self, L):
@@ -173,11 +199,21 @@ class LSSLLayer(nn.Module):
         device=None,
         activation=nn.GLU,
         a_init="diagonal",
+        learn_cd=False,
     ):
         super().__init__()
         self.prenorm = prenorm
         self.norm = nn.LayerNorm(d_model)
-        self.kernel = LSSLKernel(d_model, state_dim, l_max, dt_min, dt_max, device, a_init=a_init)
+        self.kernel = LSSLKernel(
+            d_model,
+            state_dim,
+            l_max,
+            dt_min,
+            dt_max,
+            device,
+            a_init=a_init,
+            learn_cd=learn_cd,
+        )
         self.dropout = nn.Dropout(dropout)
         # Accept both a class (nn.Tanh) and an instance (nn.Tanh()) for activation
         act_cls = activation if isinstance(activation, type) else type(activation)
@@ -194,9 +230,9 @@ class LSSLLayer(nn.Module):
 
     def _fft_conv(self, u, k):
         L = u.shape[-1]
-        n = 2 * L
-        uf = torch.fft.rfft(u, n=n, dim=-1)
-        kf = torch.fft.rfft(k, n=n, dim=-1)
+        n = 1 << (2 * L - 1).bit_length()  # next power of 2 >= 2*L
+        uf = torch.fft.rfft(u.contiguous(), n=n, dim=-1)
+        kf = torch.fft.rfft(k.contiguous(), n=n, dim=-1)
         return torch.fft.irfft(uf * kf.unsqueeze(0), n=n, dim=-1)[..., :L]
 
     def forward(self, x):
@@ -227,6 +263,10 @@ class LSSLStack(nn.Module):
         preserving backward-compatibility with existing checkpoints.
     decoder_act : nn.Module | None
         Activation used between decoder layers.  Defaults to ``nn.SiLU()``.
+    learn_cd : bool
+        If ``True``, learn SSM output/readout ``C`` and skip ``D`` terms.
+        If ``False`` (default), use a lean SSM with ``C=B`` and fixed ``D=0``
+        to reduce parameter count when a shallow decoder is used.
     """
 
     def __init__(
@@ -246,12 +286,13 @@ class LSSLStack(nn.Module):
         a_init="diagonal",
         decoder_sizes=None,
         decoder_act=None,
+        learn_cd=False,
     ):
         super().__init__()
         self.encoder = nn.Linear(d_input, d_model)
         self.layers = nn.ModuleList([
             LSSLLayer(d_model, state_dim, l_max, dt_min, dt_max, dropout,
-                      prenorm, device, activation, a_init=a_init)
+                      prenorm, device, activation, a_init=a_init, learn_cd=learn_cd)
             for _ in range(n_layers)
         ])
 
