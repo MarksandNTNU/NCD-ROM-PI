@@ -102,7 +102,7 @@ class LSSLKernel(nn.Module):
             lam = _lssl_hippo_diag(state_dim, device=device)
             self.Lambda_re = nn.Parameter(lam.real.unsqueeze(0).repeat(d_model, 1))
             self.Lambda_im = nn.Parameter(lam.imag.unsqueeze(0).repeat(d_model, 1))
-        scale = 1.0 / math.sqrt(state_dim)
+        scale = 1.0 / math.sqrt(state_dim) 
         self.B_re = nn.Parameter(torch.randn(d_model, state_dim, device=device) * scale)
         self.B_im = nn.Parameter(torch.zeros(d_model, state_dim, device=device))
         if learn_cd:
@@ -380,6 +380,7 @@ def train_model(
     Y_vl: np.ndarray,
     *,
     device: torch.device | str = "cpu",
+    optimizer_cls=torch.optim.AdamW,
     loss_fun=None,
     epochs: int = 400,
     batch_size: int = 16,
@@ -414,7 +415,7 @@ def train_model(
         shuffle=False,
     )
 
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    opt = optimizer_cls(model.parameters(), lr=lr, weight_decay=weight_decay)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=lr_patience, factor=0.5)
 
     best_val = float("inf")
